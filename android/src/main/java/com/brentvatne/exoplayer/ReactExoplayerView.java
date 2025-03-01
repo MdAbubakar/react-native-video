@@ -2407,6 +2407,7 @@ public class ReactExoplayerView extends FrameLayout implements
         }
     }
 
+
     public void setMutedModifier(boolean muted) {
         this.muted = muted;
         if (player != null) {
