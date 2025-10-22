@@ -5,7 +5,6 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.util.AttributeSet
 import android.view.View
-import android.view.View.MeasureSpec
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.media3.common.Player
@@ -60,7 +59,9 @@ class ExoPlayerView @JvmOverloads constructor(context: Context, attrs: Attribute
         // Add live badge with its own layout parameters
         val liveBadgeLayoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT)
         liveBadgeLayoutParams.setMargins(16, 16, 16, 16)
-        addView(liveBadge, liveBadgeLayoutParams)
+        if(playerView.useController) {
+            addView(liveBadge, liveBadgeLayoutParams)
+        }
     }
 
     fun setPlayer(player: ExoPlayer?) {
@@ -163,7 +164,7 @@ class ExoPlayerView @JvmOverloads constructor(context: Context, attrs: Attribute
             playerView.controllerAutoShow = true
             playerView.controllerHideOnTouch = true
             // Show controls immediately when enabled
-            playerView.showController()
+            // playerView.showController()
         }
     }
 
@@ -215,7 +216,7 @@ class ExoPlayerView @JvmOverloads constructor(context: Context, attrs: Attribute
         val seekable = player.isCurrentMediaItemSeekable
 
         // Show/hide badge
-        liveBadge.visibility = if (isLive) View.VISIBLE else View.GONE
+        liveBadge.visibility = if (isLive && playerView.useController) View.VISIBLE else View.GONE
 
         // Disable/enable scrubbing based on seekable
         val timeBar = playerView.findViewById<DefaultTimeBar?>(androidx.media3.ui.R.id.exo_progress)

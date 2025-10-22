@@ -5,7 +5,10 @@ import Foundation
     import GoogleInteractiveMediaAds
 #endif
 import React
-
+import DzAVPlayerAdapter
+import DzBase
+import DzMediaTailorAdapter
+import MediaTailorSDK
 // MARK: - RCTVideo
 
 class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverHandler {
@@ -87,6 +90,10 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
             onVideoBuffer?(["isBuffering": _isBuffering, "target": reactTag as Any])
         }
     }
+    
+    private var _dzAdapter: DzAdapter?
+    private var _session: Session?
+    private var _shouldUseMediaTailor: Bool = false
 
     /* IMA Ads */
     #if USE_GOOGLE_IMA
@@ -94,8 +101,13 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         /* Playhead used by the SDK to track content video progress and insert mid-rolls. */
         private var _contentPlayhead: IMAAVPlayerContentPlayhead?
     #endif
+    private var _hasSetUpIMA: Bool = false
     private var _didRequestAds = false
+    private var _didRequestPostRollAd: Bool = false
     private var _adPlaying = false
+    private var _skippedAdPlayed: Bool = false
+    private var _playedCuePoints: Set<Double> = []
+    private var _skippedCuePoints: Set<Double> = []
 
     private lazy var _drmManager: DRMManagerSpec? = ReactNativeVideoManager.shared.getDRMManager()
     private var _playerObserver: RCTPlayerObserver = .init()
@@ -351,7 +363,7 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
     @objc
     func applicationDidBecomeActive(notification _: NSNotification!) {
         let isExternalPlaybackActive = getIsExternalPlaybackActive()
-        if _playInBackground || _playWhenInactive || !_isPlaying || isExternalPlaybackActive { return }
+        if _playInBackground || _playWhenInactive || !_isPlaying || _paused || isExternalPlaybackActive { return }
 
         // Resume the player or any other tasks that should continue when the app becomes active.
         _player?.play()
@@ -441,10 +453,53 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
 
         if currentTimeSecs >= 0 {
             #if USE_GOOGLE_IMA
-                if !_didRequestAds && currentTimeSecs >= 0.0001 && _source?.adParams.adTagUrl != nil {
-                    _imaAdsManager.requestAds()
+            // Pre-roll Ad
+            if !_didRequestAds && currentTimeSecs >= 0.0001 && currentTimeSecs < 10 && !_paused && _source?.adParams.adTagUrl != nil {
+                    _imaAdsManager.requestAds(type: .preRoll)
                     _didRequestAds = true
                 }
+
+            // Mid-roll logic handled here only
+            if let cuePoints = _source?.adParams.cuePoints,
+               _source?.adParams.midRollAdTagUrl != nil {
+                if let highestSkipped = _skippedCuePoints.max(),
+                   currentTimeSecs >= highestSkipped,
+                   !_skippedAdPlayed,
+                   !_pendingSeek,
+                   !_paused,
+                   !_playedCuePoints.contains(highestSkipped) {
+                    print("🔁 Playing highest skipped cue: \(highestSkipped)s")
+                    _imaAdsManager.requestAds(type: .midRoll)
+                    _playedCuePoints.insert(highestSkipped)
+                    _skippedCuePoints.remove(highestSkipped)
+                    _skippedAdPlayed = true
+                    return
+                }
+
+                   // Handle normal cue point (non-skipped, just reached naturally)
+                   for cueTime in cuePoints.map({ $0.doubleValue }) {
+                       let isAtCue = abs(currentTimeSecs - cueTime) < 0.5
+                       if isAtCue && !_pendingSeek && !_paused && !_playedCuePoints.contains(cueTime) {
+                           print("▶️ Playing normal cue: \(cueTime)s")
+                           _imaAdsManager.requestAds(type: .midRoll)
+                           _playedCuePoints.insert(cueTime)
+                           if _skippedCuePoints.contains(cueTime) {
+                               _skippedCuePoints.remove(cueTime)
+                           }
+                           break
+                       }
+                   }
+            }
+
+            // Post-roll Ad: Trigger 2 seconds before end
+            if !_didRequestPostRollAd,
+               _source?.adParams.postRollAdTagUrl != nil,
+               !_paused,
+               duration - currentTimeSecs <= 1 {
+                print("Triggering post-roll ad 1 seconds before content ends.")
+                _imaAdsManager.requestAds(type: .postRoll)
+                _didRequestPostRollAd = true
+            }
             #endif
             onVideoProgress?([
                 "currentTime": currentTimeSecs,
@@ -473,7 +528,7 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
     // MARK: - Player and source
 
     func preparePlayerItem() async throws -> AVPlayerItem {
-        guard let source = _source else {
+        guard let source = self._source else {
             DebugLog("The source not exist")
             isSetSourceOngoing = false
             applyNextSource()
@@ -483,9 +538,9 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         // Perform on next run loop, otherwise onVideoLoadStart is nil
         onVideoLoadStart?([
             "src": [
-                "uri": _source?.uri ?? NSNull() as Any,
-                "type": _source?.type ?? NSNull(),
-                "isNetwork": NSNumber(value: _source?.isNetwork ?? false),
+                "uri": source.uri ?? NSNull() as Any,
+                "type": source.type ?? NSNull(),
+                "isNetwork": NSNumber(value: source.isNetwork),
             ],
             "drm": source.drm.json ?? NSNull(),
             "target": reactTag as Any,
@@ -517,7 +572,7 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
             throw NSError(domain: "", code: 0, userInfo: nil)
         }
 
-        if let startPosition = _source?.startPosition {
+        if let startPosition = source.startPosition {
             _startPosition = startPosition / 1000
         }
 
@@ -551,6 +606,128 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
 
         return await playerItemPrepareText(source: source, asset: asset, assetOptions: assetOptions, uri: source.uri ?? "")
     }
+    
+    private func isLocalFileUrl(_ url: String) -> Bool {
+        let lowercaseUrl = url.lowercased()
+        
+        return lowercaseUrl.hasPrefix("file://") ||
+               lowercaseUrl.contains("/assets/") ||
+               lowercaseUrl.contains(".app/") ||
+               lowercaseUrl.contains("bundle/application/") ||
+               lowercaseUrl.contains("/library/") ||
+               lowercaseUrl.contains("/documents/") ||
+               lowercaseUrl.contains(".movpkg") ||
+               lowercaseUrl.contains("localhost") ||
+               lowercaseUrl.hasPrefix("ph://")
+    }
+    
+    func implementMediaTailor(url: String, onSession: @escaping(Session?, SessionError?) -> Void) {
+        
+        if isLocalFileUrl(url) {
+            print("⏭️ MediaTailor: Skipping local file URL: \(url)")
+            return
+        }
+            
+        guard url.hasPrefix("http://") || url.hasPrefix("https://") else {
+            print("⏭️ MediaTailor: Invalid URL scheme for: \(url)")
+            return
+        }
+        
+        let configBuilder = Config.Builder(configurationId: "ecdfb2fa-fdc5-46ce-b793-f708b94791f1")
+        configBuilder.logLevel(logLevel: LogLevel.debug)
+        configBuilder.isProduction(isProduction: false)
+        
+        Datazoom.shared.doInit(config: configBuilder.build())
+        
+        MediaTailor.shared.setLogLevel(logLevel: LogLevel.debug)
+        
+        let palConsentSettings = PalConsentSettings.Builder()
+            .allowStorage(value: true)
+            .directedForChildOrUnknownAge(value: false)
+            .build()
+
+        MediaTailor.shared.doInitPal(consentSettings: palConsentSettings)
+
+        let features = SessionFeatures.Builder()
+          .reportingMode(value: SessionReportingMode.server)
+          .overlayAvails(value: true)
+          .build()
+        
+        let palNonceRequestParams = PalNonceRequestParams.Builder()
+            .adWillAutoPlay(value: true)
+            .adWillPlayMuted(value: false)
+            .iconsSupported(value: true)
+            .continuousPlayback(value: true)
+            .playerType(value: "AVPlayer")
+            .ppid(value: "12JD92JD8078S8J29SDOAKC0EF230337")
+            .omidPartnerName(value: _dzAdapter?.omidPartnerInfo.name ?? "amazon2")
+            .omidPartnerVersion(value: _dzAdapter?.omidPartnerInfo.version ?? "1.0.0")
+            .build()
+
+        
+        let config = SessionConfiguration.Builder()
+          .sessionInitUrl(value: url)
+          .sessionFeatures(value: features)
+          .palNonceRequestParams(value: palNonceRequestParams)
+          .build()
+
+        MediaTailor.shared.createSession(config: config, callback: { [weak self] session, error in
+            self?._session = session
+          Task {
+            await MainActor.run {
+              onSession(session, error)
+            }
+          }
+        })
+      }
+
+    func setupDataZoomAdapter(adSession: Session, videoUrl: String, videoPlayerView: UIView) {
+        _dzAdapter = Datazoom.shared.createContext(player: _player!)
+        _dzAdapter?.setMetadata(metadata: ["Meta Key": "Value"])
+        _dzAdapter?.configureAdSession(adSession: adSession, videoUrl: videoUrl, videoPlayerView: videoPlayerView)
+        NSLog("MediaTailorSDK", "Datazoom Adapter created sucessfully")
+      }
+    
+    func setUpMTEventListener(_ session: Session) {
+        NSLog("MediaTailorSDK", "Setting Event listener")
+        session.addUiEventListener(event: SessionUiEvent.adStart) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.adEnd) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.adCanSkip) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.adProgress) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.adClick) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+           
+        session.addUiEventListener(event: SessionUiEvent.adIncoming) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.nonlinearAdStart) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.nonlinearAdEnd) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+        
+        session.addUiEventListener(event: SessionUiEvent.adTrackingInfoResponse) { event, eventData in
+            NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
+        }
+    }
+
+
 
     func setupPlayer(playerItem: AVPlayerItem) async throws {
         if !isSetSourceOngoing {
@@ -571,16 +748,7 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         if _player == nil {
             _player = AVPlayer()
             ReactNativeVideoManager.shared.onInstanceCreated(id: instanceId, player: _player as Any)
-
             _player!.replaceCurrentItem(with: playerItem)
-
-            if #available(iOS 15.0, *) {
-                if _playInBackground {
-                    _player!.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-                } else {
-                    _player!.audiovisualBackgroundPlaybackPolicy = .automatic
-                }
-            }
 
             if _showNotificationControls {
                 // We need to register player after we set current item and only for init
@@ -600,14 +768,6 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
                     self._playerViewController?.allowsVideoFrameAnalysis = true
                 }
             #endif
-
-            if #available(iOS 15.0, *) {
-                if _playInBackground {
-                    _player!.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-                } else {
-                    _player!.audiovisualBackgroundPlaybackPolicy = .automatic
-                }
-            }
             // later we can just call "updateNowPlayingInfo:
             NowPlayingInfoCenterManager.shared.updateNowPlayingInfo()
         }
@@ -621,12 +781,12 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         }
 
         #if USE_GOOGLE_IMA
-            if _source?.adParams.adTagUrl != nil {
-                // Set up your content playhead and contentComplete callback.
-                _contentPlayhead = IMAAVPlayerContentPlayhead(avPlayer: _player!)
-
-                _imaAdsManager.setUpAdsLoader()
-            }
+        _imaAdsManager.releaseAds()
+        if !_hasSetUpIMA && _source?.adParams.hasAnyAds == true {
+           _contentPlayhead = IMAAVPlayerContentPlayhead(avPlayer: _player!)
+           _imaAdsManager.setUpAdsLoader()
+           _hasSetUpIMA = true
+        }
         #endif
         isSetSourceOngoing = false
         applyNextSource()
@@ -664,27 +824,56 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
             self._playerObserver.player = nil
             self._drmManager = nil
             self._playerObserver.playerItem = nil
+            
+            if let source = self._source,
+               let uri = source.uri,
+               !uri.isEmpty {
+                
+                let isLive = source.isLive == true
+                let isRemoteUrl = uri.hasPrefix("http://") || uri.hasPrefix("https://")
+                let isNotLocalFile = !self.isLocalFileUrl(uri)
+                
+                self._shouldUseMediaTailor = isLive && isRemoteUrl && isNotLocalFile
+                
+                print("📺 MediaTailor check - Live: \(isLive), Remote: \(isRemoteUrl), NotLocal: \(isNotLocalFile) → Use: \(self._shouldUseMediaTailor)")
+            } else {
+                self._shouldUseMediaTailor = false
+                print("📺 MediaTailor disabled - invalid source or URI")
+            }
+            
+            if self._shouldUseMediaTailor, let mediaTailorSessionUrl = self._source?.uri {
+                self.implementMediaTailor(url: mediaTailorSessionUrl) { session, error in
+                    if let error = error {
+                        NSLog("MediaTailorSDK", "MediaTailor session error: \(error.description)")
+                        self.loadPlayerItemNormally()
+                        return
+                    }
 
-            // perform on next run loop, otherwise other passed react-props may not be set
-            RCTVideoUtils.delay { [weak self] in
-                do {
-                    guard let self else { throw NSError(domain: "", code: 0, userInfo: nil) }
+                    guard let session = session else {
+                        NSLog("MediaTailorSDK", "MediaTailor session is nil")
+                        self.loadPlayerItemNormally()
+                        return
+                    }
 
-                    let playerItem = try await self.preparePlayerItem()
-                    try await self.setupPlayer(playerItem: playerItem)
-                } catch {
-                    DebugLog("An error occurred: \(error.localizedDescription)")
+                    // Replace source URI with MediaTailor playback URL
+                    if let playbackUrl = session.playbackUrl {
+                        NSLog("MediaTailorSDK", "MediaTailor Playback Url: \(playbackUrl)")
+                        self._source?.uri = playbackUrl
+                        
+                        self.setUpMTEventListener(session)
 
-                    if let self {
-                        self.onVideoError?(["error": error.localizedDescription])
-                        self.isSetSourceOngoing = false
-                        self.applyNextSource()
-
-                        if let player = self._player {
-                            NowPlayingInfoCenterManager.shared.removePlayer(player: player)
+                        // Setup Datazoom adapter (playerView must not be nil)
+                        if let playerView = self._playerViewController?.view {
+                            self.setupDataZoomAdapter(adSession: session, videoUrl: playbackUrl, videoPlayerView: playerView)
                         }
                     }
+
+                    // Now start preparing and setting the player item
+                    self.loadPlayerItemNormally()
                 }
+            } else {
+                // Normal VOD flow
+                self.loadPlayerItemNormally()
             }
 
             self._videoLoadStarted = true
@@ -692,6 +881,25 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         }
 
         DispatchQueue.global(qos: .default).async(execute: initializeSource)
+    }
+
+    func loadPlayerItemNormally() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let playerItem = try await self.preparePlayerItem()
+                try await self.setupPlayer(playerItem: playerItem)
+            } catch {
+                DebugLog("Error preparing player item: \(error.localizedDescription)")
+                self.onVideoError?(["error": error.localizedDescription])
+                self.isSetSourceOngoing = false
+                self.applyNextSource()
+
+                if let player = self._player {
+                    NowPlayingInfoCenterManager.shared.removePlayer(player: player)
+                }
+            }
+        }
     }
 
     func playerItemPrepareText(source: VideoSource, asset: AVAsset!, assetOptions: NSDictionary?, uri: String) async -> AVPlayerItem {
@@ -878,29 +1086,46 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
 
     @objc
     func setSeek(_ time: NSNumber, _ tolerance: NSNumber) {
-        let item: AVPlayerItem? = _player?.currentItem
+        guard let player = _player,
+              let item = player.currentItem,
+              item.status == .readyToPlay else {
+            _pendingSeekTime = time.floatValue
+            return
+        }
 
         _pendingSeek = true
 
-        guard item != nil, let player = _player, let item, item.status == AVPlayerItem.Status.readyToPlay else {
-            _pendingSeekTime = time.floatValue
-            return
+        let oldTime = CMTimeGetSeconds(player.currentTime())
+        let newTime = time.doubleValue
+
+        if newTime > oldTime, let cuePoints = _source?.adParams.cuePoints {
+            let skipped = cuePoints.map { $0.doubleValue }
+                .filter { $0 > oldTime && $0 < newTime && !_playedCuePoints.contains($0) }
+
+            for cue in skipped {
+                print("🕒 Seeked over cue point \(cue)s — marking as skipped")
+                _skippedCuePoints.insert(cue)
+                _skippedAdPlayed = false
+            }
         }
 
         RCTPlayerOperations.seek(
             player: player,
             playerItem: item,
             paused: _paused,
-            seekTime: time.floatValue,
+            seekTime: Float(newTime),
             seekTolerance: tolerance.floatValue
-        ) { [weak self] (_: Bool) in
+        ) { [weak self] _ in
             guard let self else { return }
 
             self._playerObserver.addTimeObserverIfNotSet()
             self.setPaused(self._paused)
-            self.onVideoSeek?(["currentTime": NSNumber(value: Float(CMTimeGetSeconds(item.currentTime()))),
-                               "seekTime": time,
-                               "target": self.reactTag as Any])
+
+            self.onVideoSeek?([
+                "currentTime": NSNumber(value: Float(CMTimeGetSeconds(item.currentTime()))),
+                "seekTime": time,
+                "target": self.reactTag as Any
+            ])
         }
 
         _pendingSeek = false
@@ -1356,6 +1581,14 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         return _source?.adParams.adTagUrl
     }
 
+    func getMidrollAdTagUrl() -> String? {
+        return _source?.adParams.midRollAdTagUrl
+    }
+
+    func getPostrollAdTagUrl() -> String? {
+        return _source?.adParams.postRollAdTagUrl
+    }
+
     #if USE_GOOGLE_IMA
         func getContentPlayhead() -> IMAAVPlayerContentPlayhead? {
             return _contentPlayhead
@@ -1633,12 +1866,19 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
         }
     }
 
-    // Continue playing (or not if paused) after being paused due to hitting an unbuffered zone.
+    // Continue playing (or not if paused) after being paused due to hitting an unbered zone.
     func handlePlaybackLikelyToKeepUp(playerItem _: AVPlayerItem, change _: NSKeyValueObservedChange<Bool>) {
         if _isBuffering {
             _isBuffering = false
         }
+        
+        // Prevent auto-resume if user has manually paused the video
+        if _paused {
+            _player?.pause()
+            _player?.rate = 0.0
+        }
     }
+
 
     func handleTimeControlStatusChange(player: AVPlayer, change: NSKeyValueObservedChange<AVPlayer.TimeControlStatus>) {
         if player.timeControlStatus == change.oldValue && change.oldValue != nil {
@@ -1648,6 +1888,13 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
             return
         }
         let isPlaying = player.timeControlStatus == .playing
+        
+        // If user has paused but player auto-resumed, pause it again
+        if isPlaying && _paused && !_isBuffering {
+            _player?.pause()
+            _player?.rate = 0.0
+            return
+        }
 
         guard _isPlaying != isPlaying else { return }
         _isPlaying = isPlaying

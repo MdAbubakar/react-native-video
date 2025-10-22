@@ -29,10 +29,14 @@ type VideoMetadata = Readonly<{
 export type AdsConfig = Readonly<{
   adTagUrl?: string;
   adLanguage?: string;
+  midRollAdTagUrl?: string;
+  postRollAdTagUrl?: string;
+  cuePoints?: number[];
 }>;
 
 export type VideoSrc = Readonly<{
   uri?: string;
+  isLive?: boolean;
   isNetwork?: boolean;
   isAsset?: boolean;
   isLocalAssetFile?: boolean;
@@ -298,7 +302,6 @@ export type OnVideoErrorData = Readonly<{
     localizedRecoverySuggestion?: string; // ios
     domain?: string; // ios
   }>;
-  cause?: object; // React Native convertThrowableToJSError/convertNSExceptionToJSError
   target?: Int32; // ios
 }>;
 

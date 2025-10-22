@@ -22,6 +22,7 @@ export type EnumValues<T extends string | number> = T extends string
 
 export type ReactVideoSourceProperties = {
   uri?: string;
+  isLive?: boolean;
   isNetwork?: boolean;
   isAsset?: boolean;
   isLocalAssetFile?: boolean;
@@ -80,6 +81,9 @@ export enum DRMType {
 export type AdConfig = Readonly<{
   adTagUrl?: string;
   adLanguage?: ISO639_1;
+  midRollAdTagUrl?: string;
+  postRollAdTagUrl?: string;
+  cuePoints?: number[];
 }>;
 
 export type Drm = Readonly<{
