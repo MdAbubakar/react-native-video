@@ -128,7 +128,7 @@
                 print("Error loading ads: " + adErrorData.adError.message!)
             }
 
-            _video?.setPaused(false)
+             // _video?.setPaused(false)
         }
 
         // MARK: - IMAAdsManagerDelegate
@@ -199,7 +199,7 @@
             }
 
             // Fall back to playing content
-            _video.setPaused(false)
+            // _video.setPaused(false)
         }
 
         func adsManagerDidRequestContentPause(_: IMAAdsManager) {

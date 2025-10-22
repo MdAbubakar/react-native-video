@@ -164,15 +164,6 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
 
     func handlePictureInPictureExit() {
         onPictureInPictureStatusChanged?(["isActive": NSNumber(value: false)])
-
-        // To continue audio playback in backgroud we need to set
-        // player in _playerLayer & _playerViewController to nil
-        let appState = UIApplication.shared.applicationState
-        if _playInBackground && appState == .background {
-            _playerLayer?.player = nil
-            _playerViewController?.player = nil
-            _player?.play()
-        }
     }
 
     func handleRestoreUserInterfaceForPictureInPictureStop() {
@@ -363,7 +354,7 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
     @objc
     func applicationDidBecomeActive(notification _: NSNotification!) {
         let isExternalPlaybackActive = getIsExternalPlaybackActive()
-        if _playInBackground || _playWhenInactive || !_isPlaying || _paused || isExternalPlaybackActive { return }
+        if _playInBackground || _playWhenInactive || !_isPlaying || isExternalPlaybackActive { return }
 
         // Resume the player or any other tasks that should continue when the app becomes active.
         _player?.play()
@@ -726,8 +717,6 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
             NSLog("MediaTailorSDK", "ad event: \(event): \(eventData)")
         }
     }
-
-
 
     func setupPlayer(playerItem: AVPlayerItem) async throws {
         if !isSetSourceOngoing {
