@@ -94,6 +94,7 @@
             // Issue found on tvOS 17, or iOS if view detach & STARTED event happen at the same moment
             adsManager.volume = 0
             adsManager.pause()
+            _video?.setPaused(true)
             adsManager.destroy()
         }
 

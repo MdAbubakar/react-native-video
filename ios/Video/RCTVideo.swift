@@ -783,12 +783,56 @@ class RCTVideo: UIView, RCTVideoPlayerViewControllerDelegate, RCTPlayerObserverH
 
     @objc
     func setSrc(_ source: NSDictionary!) {
+        #if USE_GOOGLE_IMA
+        if _hasSetUpIMA && source == nil {
+            _imaAdsManager.releaseAds()
+            _didRequestAds = false
+            _didRequestPostRollAd = false
+            _adPlaying = false
+        }
+        #endif
         if self.isSetSourceOngoing || self.nextSource != nil {
             DebugLog("setSrc buffer request")
             self._player?.replaceCurrentItem(with: nil)
             nextSource = source
             return
         }
+        
+        guard source != nil else {
+               DebugLog("setSrc Stopping playback (nil source)")
+
+               // Stop main content playback
+               _player?.pause()
+               _player?.rate = 0.0
+
+               // Remove current item to break any underlying AVPlayerItem / IMA ties
+               _player?.replaceCurrentItem(with: nil)
+
+               // Clear observers and state
+               _playerObserver.playerItem = nil
+               _playerObserver.player = nil
+               _drmManager = nil
+               _videoLoadStarted = false
+               _pendingSeek = false
+               _skippedCuePoints.removeAll()
+               _playedCuePoints.removeAll()
+               nextSource = nil
+               isSetSourceOngoing = false
+
+               // Remove from Now Playing & audio session
+               if let player = self._player {
+                   NowPlayingInfoCenterManager.shared.removePlayer(player: player)
+               }
+
+               // Remove visual layer so no pip / overlay is left attached
+               DispatchQueue.main.async {
+                   self.removePlayerLayer()
+                   self._playerViewController?.player = nil
+               }
+
+               return
+           }
+
         self.isSetSourceOngoing = true
 
         let initializeSource = {
