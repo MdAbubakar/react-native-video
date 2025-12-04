@@ -54,12 +54,17 @@ import React
             self._restoreUserInterfaceForPIPStopCompletionHandler = nil
         }
 
+        private func isLiveStream(_ player: AVPlayer?) -> Bool {
+            return player?.currentItem?.asset.duration.isIndefinite ?? false
+        }
+
         func setupPipController(_ playerLayer: AVPlayerLayer?) {
             guard let playerLayer else { return }
             if !AVPictureInPictureController.isPictureInPictureSupported() { return }
             // Create new controller passing reference to the AVPlayerLayer
             _pipController = AVPictureInPictureController(playerLayer: playerLayer)
             if #available(iOS 14.2, *) {
+                _pipController?.requiresLinearPlayback = isLiveStream(playerLayer.player)
                 _pipController?.canStartPictureInPictureAutomaticallyFromInline = true
             }
             _pipController?.delegate = self
